@@ -2,15 +2,13 @@
 ==============================================================================
 Aqua-Sentry Prototype: Live Webcam & Autonomous Teleoperation Console
 ==============================================================================
-Designed for Prototype Bench & Pool Testing:
-  1. Video Source: USB Webcam (Plug-and-play directly into laptop).
-  2. Quick Color Calibration Trackbars:
-     - Press [T] to open live HSV sliders to calibrate detection for your test debris.
-     - Live Mask preview (White = Detected Trash, Black = Ignored Water).
-     - Automatically saves your calibrated values to hsv_config.json!
-  3. Visual Guidance: Intake corridor lines showing where trash enters the rear net.
-  4. Autonomous Cycle: Detects debris -> Steers to it -> Drives over it -> Targets next!
-  5. Operator Safety: Instant W/A/S/D manual takeover + [X] Emergency Kill Switch.
+Mechanism: Passive Flow-Through Rear Mesh Collection (WasteShark Principle)
+  1. No moving roller / paddle wheel motor required.
+  2. Floating trash is funneled between the twin hulls as the boat moves forward.
+  3. Debris is pushed by forward hydrodynamic flow directly into the rear mesh basket.
+  4. Once trapped in the rear mesh, the system automatically acquires the next target!
+  5. Operator Controls: Instant W/A/S/D manual takeover + [X] Emergency Kill Switch.
+  6. Calibration: Press [T] for live HSV color tuning sliders with auto-save.
 ==============================================================================
 """
 
@@ -25,16 +23,15 @@ from datetime import datetime
 # ==========================================
 # PROTOTYPE CONFIGURATION
 # ==========================================
-CAMERA_INDEX = 0      # 0 = Built-in / First Webcam, 1 = External USB Webcam
+CAMERA_INDEX = 0      # 0 = Default / Built-in, 1 = External USB Webcam
 SERIAL_PORT  = "COM3" # Arduino COM port (e.g. "COM3" on Windows, or None)
 BAUD_RATE    = 115200
-WINDOW_TITLE = "Aqua-Sentry Catamaran Prototype Console"
+WINDOW_TITLE = "Aqua-Sentry WasteShark-Style Console"
 CONFIG_FILE  = "hsv_config.json"
 
 # ==========================================
 # HSV COLOR CALIBRATION DEFAULTS
 # ==========================================
-# Default values optimized for bright floating plastics / white styrofoam
 hsv_params = {
     "h_min": 0,   "h_max": 180,
     "s_min": 0,   "s_max": 65,
@@ -110,7 +107,7 @@ except Exception as e:
     print(f"[SERIAL] Running without hardware serial ({e}).")
 
 def send_command(cmd_char):
-    """Sends a 1-character command to Arduino."""
+    """Sends a 1-character command ('F','B','L','R','S','A','M','X') to Arduino."""
     if ser and ser.is_open:
         try:
             ser.write(cmd_char.encode('utf-8'))
@@ -119,18 +116,13 @@ def send_command(cmd_char):
     print(f">> COMMAND SENT: [{cmd_char}]")
 
 # ==========================================
-# TRASH DETECTION USING CALIBRATED HSV
+# TRASH DETECTION (CALIBRATED HSV)
 # ==========================================
 def find_floating_trash(frame):
-    """
-    Applies calibrated HSV thresholding and morphology.
-    Returns: (targets, clean_mask)
-    targets: list of (x, y, w, h, cx, cy, area) sorted closest to boat first.
-    """
     h, w, _ = frame.shape
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Focus detection on water surface (ignore upper 30% horizon/ceiling)
+    # Focus detection on water surface ahead (ignore upper 30% horizon)
     roi_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.rectangle(roi_mask, (0, int(h * 0.30)), (w, h), 255, -1)
 
@@ -140,7 +132,6 @@ def find_floating_trash(frame):
     mask = cv2.inRange(hsv, lower_bound, upper_bound)
     mask = cv2.bitwise_and(mask, roi_mask)
 
-    # Clean up small ripples and glints
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     clean = cv2.dilate(clean, kernel, iterations=2)
@@ -150,7 +141,7 @@ def find_floating_trash(frame):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if 400 < area < 45000: # Ignore tiny specks and whole-screen noise
+        if 400 < area < 45000:
             x, y, cw, ch = cv2.boundingRect(cnt)
             cx = x + cw // 2
             cy = y + ch // 2
@@ -163,14 +154,14 @@ def find_floating_trash(frame):
 # MAIN APPLICATION
 # ==========================================
 def main():
-    print("=" * 65)
-    print("  Aqua-Sentry Prototype Mission Console (Webcam Edition)")
-    print("=" * 65)
+    print("=" * 68)
+    print("  Aqua-Sentry WasteShark-Style Prototype Console (Passive Mesh)")
+    print("=" * 68)
     print(f"Connecting to Webcam (Index {CAMERA_INDEX})...")
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"[WARN] Camera index {CAMERA_INDEX} failed. Trying index 1 (External USB Webcam)...")
+        print(f"[WARN] Camera index {CAMERA_INDEX} failed. Trying index 1...")
         cap = cv2.VideoCapture(1)
         if not cap.isOpened():
             print("[FATAL] No webcam found! Please ensure your USB webcam is plugged in.")
@@ -188,22 +179,20 @@ def main():
         with open(csv_file, "w", newline="") as f:
             csv.writer(f).writerow(["Timestamp", "Item_ID", "Status"])
 
-    # State Variables
     mode = "MANUAL"
     calibration_mode = False
     collected_count = 0
     state_timer = time.time()
     last_steer_time = 0
-    status_text = "Prototype ready. Use W/A/S/D to drive or press [A] for Auto Cleaning."
+    status_text = "Ready. Use W/A/S/D to steer or press [A] for Autonomous WasteShark Cleaning."
 
     print("\n[CONTROLS]:")
-    print("  T       : Toggle Quick Color Calibration Trackbars")
-    print("  W/A/S/D : Manual Differential Steering")
+    print("  T       : Toggle Color Calibration Sliders")
+    print("  W/A/S/D : Manual Steering")
     print("  SPACE   : Brake / Stop")
-    print("  X       : EMERGENCY KILL SWITCH (Stops All Motors)")
-    print("  A       : Start Autonomous Water Cleaning Cycle")
+    print("  X       : EMERGENCY KILL SWITCH (Stops Thrusters Immediately)")
+    print("  A       : Start Autonomous Flow-Through Collection")
     print("  M       : Switch to Manual Standby")
-    print("  C       : Toggle Trash Collector Motor")
     print("  P       : Take Snapshot")
     print("  Q       : Exit Console\n")
 
@@ -218,13 +207,13 @@ def main():
         now = time.time()
 
         # ----------------------------------------------------
-        # 1. INTAKE CORRIDOR (Guides to Rear Netting)
+        # 1. HULL INTAKE CORRIDOR (Guides to Rear Mesh Basket)
         # ----------------------------------------------------
         intake_left = int(w * 0.35)
         intake_right = int(w * 0.65)
         cv2.line(frame, (intake_left, int(h * 0.40)), (intake_left, h), (0, 255, 255), 2)
         cv2.line(frame, (intake_right, int(h * 0.40)), (intake_right, h), (0, 255, 255), 2)
-        cv2.putText(frame, "REAR TRASH NET CORRIDOR", (intake_left + 15, h - 20),
+        cv2.putText(frame, "REAR MESH BASKET CORRIDOR", (intake_left + 15, h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         # ----------------------------------------------------
@@ -249,7 +238,6 @@ def main():
         # 3. COLOR CALIBRATION PREVIEW INSET
         # ----------------------------------------------------
         if calibration_mode:
-            # Show live threshold mask as small Picture-in-Picture in top-right
             mask_bgr = cv2.cvtColor(mask_clean, cv2.COLOR_GRAY2BGR)
             pip_w, pip_h = int(w * 0.25), int(h * 0.25)
             pip_mask = cv2.resize(mask_bgr, (pip_w, pip_h))
@@ -259,7 +247,7 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
         # ----------------------------------------------------
-        # 4. AUTONOMOUS CLEANING LOGIC
+        # 4. PASSIVE FLOW-THROUGH COLLECTION LOGIC (WASTESHARK)
         # ----------------------------------------------------
         if mode.startswith("AUTO"):
             if active_target:
@@ -267,39 +255,41 @@ def main():
                 error_x = pcx - center_x
                 deadband = int(w * 0.08)
 
+                # Check if debris entered between the twin pontoons
                 if pcy > int(h * 0.78) and (intake_left - 30 <= pcx <= intake_right + 30):
-                    if mode != "AUTO_INGEST":
-                        mode = "AUTO_INGEST"
+                    if mode != "AUTO_CAPTURE":
+                        mode = "AUTO_CAPTURE"
                         state_timer = now
-                        send_command('C')
-                        send_command('F')
+                        send_command('F') # Keep driving forward so water flow carries trash into rear mesh!
 
-                    status_text = "SCOOPING: Driving over trash into rear netting cover!"
+                    status_text = "COLLECTING: Forward motion pushing debris into rear mesh basket..."
 
-                    if now - state_timer > 2.0:
+                    # Drive forward for 1.8s so debris is fully trapped inside the rear basket
+                    if now - state_timer > 1.8:
                         collected_count += 1
                         time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         with open(csv_file, "a", newline="") as f:
-                            csv.writer(f).writerow([time_str, collected_count, "COLLECTED"])
+                            csv.writer(f).writerow([time_str, collected_count, "COLLECTED_IN_REAR_MESH"])
 
-                        snap_name = f"trash_data/captures/haul_{collected_count}.jpg"
+                        snap_name = f"trash_data/captures/mesh_capture_{collected_count}.jpg"
                         cv2.imwrite(snap_name, frame)
-                        print(f"[COLLECTION] Trash #{collected_count} scooped! Saved proof to {snap_name}")
+                        print(f"[SUCCESS] Trash #{collected_count} trapped in rear mesh! Saved proof to {snap_name}")
 
                         mode = "AUTO_SEARCH"
-                        status_text = f"Collected trash #{collected_count}! Looking for next target..."
+                        status_text = f"Collected #{collected_count}! Acquiring next target..."
                 else:
+                    # Steer boat so the trash enters the central hull throat
                     mode = "AUTO_APPROACH"
                     if now - last_steer_time > 0.4:
                         if error_x < -deadband:
                             send_command('L')
-                            status_text = "Steering LEFT toward floating debris..."
+                            status_text = "Aligning: Steering LEFT to funnel debris into hull..."
                         elif error_x > deadband:
                             send_command('R')
-                            status_text = "Steering RIGHT toward floating debris..."
+                            status_text = "Aligning: Steering RIGHT to funnel debris into hull..."
                         else:
                             send_command('F')
-                            status_text = "Aligned! Driving forward to collect..."
+                            status_text = "Aligned with hull channel! Cruising forward to collect..."
                         last_steer_time = now
             else:
                 mode = "AUTO_SEARCH"
@@ -317,14 +307,14 @@ def main():
         mode_color = (0, 255, 0) if mode.startswith("AUTO") else (88, 166, 255)
         if mode == "EMERGENCY_STOP": mode_color = (0, 0, 255)
 
-        cv2.putText(frame, "AQUA-SENTRY PROTOTYPE", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.putText(frame, "AQUA-SENTRY (PASSIVE MESH INTAKE)", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
         cv2.putText(frame, f"MODE: {mode}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 2)
-        cv2.putText(frame, f"COLLECTED: {collected_count}", (260, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-        cv2.putText(frame, f"IN SIGHT: {len(targets)}", (440, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame, f"IN REAR MESH: {collected_count}", (260, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        cv2.putText(frame, f"IN SIGHT: {len(targets)}", (480, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
         calib_status = "[CALIBRATION: ON - Press T to Close]" if calibration_mode else "[T: Color Calibrate]"
         calib_color = (0, 215, 255) if calibration_mode else (120, 120, 120)
-        cv2.putText(frame, calib_status, (600, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.50, calib_color, 1)
+        cv2.putText(frame, calib_status, (640, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.50, calib_color, 1)
 
         # Status Ribbon (Bottom)
         cv2.rectangle(frame, (0, h - 35), (w, h), (15, 15, 15), -1)
@@ -341,7 +331,7 @@ def main():
             send_command('S')
             save_hsv_config()
             break
-        elif key == ord('t'): # Toggle Calibration Trackbars
+        elif key == ord('t'):
             calibration_mode = not calibration_mode
             if calibration_mode:
                 setup_trackbars()
@@ -356,7 +346,6 @@ def main():
         elif key == ord('a'):
             mode = "AUTO_SEARCH"
             send_command('A')
-            send_command('C')
         elif key == ord('m'):
             mode = "MANUAL"
             send_command('M')
@@ -366,8 +355,6 @@ def main():
             mode = "EMERGENCY_STOP"
             send_command('X')
             status_text = "EMERGENCY STOP ACTIVATED! ALL MOTORS STOPPED."
-        elif key == ord('c'):
-            send_command('C')
         elif key == ord('p'):
             t_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             snap_path = f"trash_data/captures/manual_{t_str}.jpg"
