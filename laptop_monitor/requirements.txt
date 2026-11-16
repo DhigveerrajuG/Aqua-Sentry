@@ -1,4 +1,3 @@
 opencv-python>=4.8.0
 numpy>=1.23.0
-# Optional: Install ultralytics for full YOLOv8 marine model inference
-# pip install ultralytics
+pyserial>=3.5

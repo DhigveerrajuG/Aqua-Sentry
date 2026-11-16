@@ -1,269 +1,321 @@
 """
 ==============================================================================
-Aqua-Sentry Unified Desktop Ground Station & Teleoperation Console
+Aqua-Sentry Prototype: Live Webcam & Autonomous Teleoperation Console
 ==============================================================================
-Displays an all-in-one multi-pane dashboard in a single widescreen window:
-  - Left Pane: Live AI Video Feed with classification boxes, target vector, and intake guides.
-  - Right Pane:
-      1. 2D Geofence Radar Mini-Map (preset boundary, covered cells, boat trajectory).
-      2. Telemetry Cards (Area swept m², coverage %, payload mass kg, volume L, haul count).
-      3. Live State Ribbon & Safety Watchdog Indicator.
-      4. Quick-action Keyboard Control Guide.
+Designed for Prototype Bench & Pool Testing:
+  1. Video Source: USB Webcam (Plug-and-play directly into laptop).
+  2. Communication: Direct USB Serial to Arduino (COM port) or Preview Mode.
+  3. Visual Guidance: Intake corridor lines showing where trash enters the rear net.
+  4. Autonomous Cycle: Detects debris -> Steers to it -> Drives over it -> Targets next!
+  5. Operator Safety: Instant W/A/S/D manual takeover + [X] Emergency Kill Switch.
 ==============================================================================
 """
 
 import cv2
+import numpy as np
 import time
 import os
-import urllib.request
-import numpy as np
+import csv
 from datetime import datetime
 
-from trash_classifier import TrashClassifier
-from trash_logger import TrashLogger
-from geofence_mapper import GeofenceMapper
-from autonomous_cleaner import AutonomousCleaner, CleanerState
+# ==========================================
+# PROTOTYPE CONFIGURATION
+# ==========================================
+# Camera Index: 0 = Default / Built-in, 1 = External USB Webcam
+CAMERA_INDEX = 0
 
-# Network Configuration
-BASE_URL = "http://192.168.4.1"
-STREAM_URL = f"{BASE_URL}:81/stream"
-CONTROL_URL = f"{BASE_URL}/control?cmd="
-WINDOW_NAME = "Aqua-Sentry Unified Mission Control Console"
+# Arduino Serial Connection (Set to your COM port, e.g. "COM3", or None for preview)
+SERIAL_PORT = "COM3"
+BAUD_RATE   = 115200
 
-CLASS_COLORS = {
-    "Plastic Bottle": (255, 165, 0),    # Orange
-    "Drink Can":      (0, 215, 255),    # Yellow
-    "Styrofoam":      (255, 255, 255),  # White
-    "Plastic Bag":    (204, 0, 204),    # Magenta
-    "Plastic Debris": (0, 255, 128)     # Mint Green
-}
+# Window Settings
+WINDOW_TITLE = "Aqua-Sentry Catamaran Prototype Console"
 
-def send_boat_command(cmd_char):
-    """Transmits HTTP control commands to the catamaran over Wi-Fi."""
-    try:
-        url = f"{CONTROL_URL}{cmd_char}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'AquaSentryClient'})
-        urllib.request.urlopen(req, timeout=0.15)
-    except Exception:
-        pass
+# ==========================================
+# SERIAL HARDWARE BRIDGE
+# ==========================================
+ser = None
+try:
+    import serial
+    import serial.tools.list_ports
+    
+    # Auto-detect Arduino if available
+    available_ports = [p.device for p in serial.tools.list_ports.comports()]
+    target_port = SERIAL_PORT if SERIAL_PORT in available_ports else (available_ports[0] if available_ports else None)
+    
+    if target_port:
+        ser = serial.Serial(target_port, BAUD_RATE, timeout=0.1)
+        print(f"[SERIAL] Connected to Arduino on {target_port} at {BAUD_RATE} baud.")
+    else:
+        print("[SERIAL] No Arduino detected. Running in PREVIEW / SIMULATION mode.")
+except Exception as e:
+    print(f"[SERIAL] Running without hardware serial ({e}).")
 
+def send_command(cmd_char):
+    """Sends a 1-character command ('F','B','L','R','S','A','M','C','X') to Arduino."""
+    if ser and ser.is_open:
+        try:
+            ser.write(cmd_char.encode('utf-8'))
+        except Exception:
+            pass
+    print(f">> COMMAND SENT: [{cmd_char}]")
+
+# ==========================================
+# TRASH DETECTION (HSV COLOR + CONTOURS)
+# ==========================================
+def find_floating_trash(frame):
+    """
+    Detects floating bottles, styrofoam, and plastics on water.
+    Returns: list of (x, y, w, h, cx, cy, area) sorted by closest to boat first.
+    """
+    h, w, _ = frame.shape
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Focus detection on the water ahead (ignore upper 30% horizon/room)
+    roi_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(roi_mask, (0, int(h * 0.30)), (w, h), 255, -1)
+
+    # Detect bright white/clear plastics & styrofoam
+    mask_white = cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 55, 255]))
+
+    # Detect bright colored debris (bottles, caps, colored plastics)
+    mask_colored = cv2.inRange(hsv, np.array([10, 80, 100]), np.array([35, 255, 255]))
+
+    mask = cv2.bitwise_or(mask_white, mask_colored)
+    mask = cv2.bitwise_and(mask, roi_mask)
+
+    # Clean noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    clean = cv2.dilate(clean, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    targets = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 400 < area < 45000: # Filter out specks and huge walls
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            cx = x + cw // 2
+            cy = y + ch // 2
+            targets.append((x, y, cw, ch, cx, cy, area))
+
+    # Sort closest debris to catamaran first (bottom of screen)
+    targets.sort(key=lambda t: t[5], reverse=True)
+    return targets
+
+# ==========================================
+# MAIN PROTOTYPE APPLICATION
+# ==========================================
 def main():
-    print("=" * 75)
-    print("  Aqua-Sentry Unified Ground Control Station (Multi-Pane Dashboard)")
-    print("=" * 75)
-    print("Connecting to live video stream at:", STREAM_URL)
-    print("Controls:")
-    print("  [A] Autonomous Roomba Mode | [M] Manual Standby Mode")
-    print("  [W/A/S/D] Steering (Touching any key immediately overrides autonomous mode)")
-    print("  [SPACE] Instant Brake | [X] EMERGENCY KILL SWITCH")
-    print("  [C] Toggle Collector Paddle | [P] Screenshot | [Q] Exit\n")
+    print("=" * 65)
+    print("  Aqua-Sentry Prototype Mission Console (Webcam Edition)")
+    print("=" * 65)
+    print(f"Connecting to Webcam (Index {CAMERA_INDEX})...")
 
-    cap = cv2.VideoCapture(STREAM_URL)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print("[WARN] Port 81 failed, trying fallback port 80...")
-        cap = cv2.VideoCapture(f"{BASE_URL}/stream")
+        print(f"[WARN] Camera index {CAMERA_INDEX} failed. Trying index 1 (External USB Webcam)...")
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
-            print("[FATAL] Could not connect to camera stream. Check Wi-Fi connection to 'AquaSentry-Vision'.")
+            print("[FATAL] No webcam found! Please ensure your USB webcam is plugged in.")
             return
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 1280, 720)
+    # Set 720p resolution
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # Initialize Modules (Preset: 20m x 25m water zone)
-    geofence = GeofenceMapper(pond_width_m=20.0, pond_length_m=25.0, boat_swath_m=0.6)
-    classifier = TrashClassifier(use_yolo=False)
-    logger = TrashLogger(data_dir="trash_data")
-    cleaner = AutonomousCleaner(send_cmd_fn=send_boat_command, geofence_mapper=geofence)
+    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_TITLE, 1024, 600)
 
-    prev_time = time.time()
-    fps = 0.0
+    # Initialize data logging
+    os.makedirs("trash_data/captures", exist_ok=True)
+    csv_file = "trash_data/collected_trash.csv"
+    if not os.path.exists(csv_file):
+        with open(csv_file, "w", newline="") as f:
+            csv.writer(f).writerow(["Timestamp", "Item_ID", "Status"])
+
+    # State Variables
+    mode = "MANUAL" # MANUAL, AUTO_SEARCH, AUTO_APPROACH, AUTO_INGEST
+    collected_count = 0
+    state_timer = time.time()
+    last_steer_time = 0
+    status_text = "Prototype ready. Use W/A/S/D to drive or press [A] for Auto Cleaning."
+
+    print("\n[CONTROLS]:")
+    print("  W/A/S/D : Manual Differential Steering")
+    print("  SPACE   : Brake / Stop")
+    print("  X       : EMERGENCY KILL SWITCH (Stops All Motors)")
+    print("  A       : Start Autonomous Water Cleaning Cycle")
+    print("  M       : Switch to Manual Standby")
+    print("  C       : Toggle Trash Collector Motor")
+    print("  P       : Take Snapshot")
+    print("  Q       : Exit Console\n")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
-            cap.release()
-            cap = cv2.VideoCapture(STREAM_URL)
+            print("[WARN] Dropped webcam frame.")
+            time.sleep(0.05)
             continue
 
+        h, w, _ = frame.shape
+        center_x = w // 2
         now = time.time()
-        fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 0.0001))
-        prev_time = now
-
-        # Resize video feed to 800x600 for left pane
-        feed_w, feed_h = 800, 600
-        feed = cv2.resize(frame, (feed_w, feed_h))
-        center_x = feed_w // 2
-
-        # Central intake channel guidelines
-        intake_left = int(feed_w * 0.35)
-        intake_right = int(feed_w * 0.65)
-        cv2.line(feed, (intake_left, int(feed_h * 0.45)), (intake_left, feed_h), (0, 255, 255), 2)
-        cv2.line(feed, (intake_right, int(feed_h * 0.45)), (intake_right, feed_h), (0, 255, 255), 2)
-        cv2.putText(feed, "REAR COLLECTION COVER CORRIDOR", (intake_left + 10, feed_h - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
 
         # ----------------------------------------------------
-        # 1. AI TRASH IDENTIFICATION & REFLECTION FILTERING
+        # 1. INTAKE CORRIDOR (Guides to Rear Trash Netting)
         # ----------------------------------------------------
-        verified_debris = classifier.process_frame(feed)
-        for item in verified_debris:
-            bx, by, bw, bh = item["bbox"]
-            c_name = item["class_name"]
-            conf = item["confidence"]
-            t_id = item["track_id"]
-            color = CLASS_COLORS.get(c_name, (0, 255, 0))
-
-            cv2.rectangle(feed, (bx, by), (bx + bw, by + bh), color, 2)
-            cv2.putText(feed, f"#{t_id} {c_name} {int(conf * 100)}%", 
-                        (bx, max(by - 8, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 2)
+        intake_left = int(w * 0.35)
+        intake_right = int(w * 0.65)
+        cv2.line(frame, (intake_left, int(h * 0.40)), (intake_left, h), (0, 255, 255), 2)
+        cv2.line(frame, (intake_right, int(h * 0.40)), (intake_right, h), (0, 255, 255), 2)
+        cv2.putText(frame, "REAR TRASH NET CORRIDOR", (intake_left + 15, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
         # ----------------------------------------------------
-        # 2. AUTONOMOUS CLEANING & GEOFENCE DECISION
+        # 2. DETECT FLOATING TRASH
         # ----------------------------------------------------
-        decision = cleaner.update(feed, verified_debris, logger)
-        target_box = decision["target_box"]
-        target_vector = decision["target_vector"]
-        hud_color = decision["hud_color"]
-        status_msg = decision["status_message"]
+        targets = find_floating_trash(frame)
+        active_target = None
 
-        if target_vector:
-            cv2.line(feed, target_vector[0], target_vector[1], (0, 255, 0), 2)
-            cv2.circle(feed, target_vector[1], 5, (0, 0, 255), -1)
+        if targets:
+            active_target = targets[0] # Closest target
+            for (tx, ty, tw, th, cx, cy, area) in targets:
+                cv2.rectangle(frame, (tx, ty), (tx + tw, ty + th), (0, 255, 0), 2)
+                cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
 
-        if target_box:
-            tx, ty, tw, th = target_box
-            cv2.rectangle(feed, (tx - 3, ty - 3), (tx + tw + 6, ty + th + 6), (0, 255, 0), 3)
+            # Draw target vector to closest debris
+            _, _, _, _, pcx, pcy, _ = active_target
+            cv2.line(frame, (center_x, h - 30), (pcx, pcy), (0, 255, 0), 2)
+            cv2.putText(frame, "TRASH TARGET", (active_target[0], max(active_target[1] - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         # ----------------------------------------------------
-        # 3. BUILD ALL-IN-ONE MULTI-PANE DASHBOARD CANVAS (1280x720)
+        # 3. PROTOTYPE AUTONOMOUS CLEANING LOGIC
         # ----------------------------------------------------
-        canvas = np.full((720, 1280, 3), 15, dtype=np.uint8) # Dark theme background
+        if mode.startswith("AUTO"):
+            if active_target:
+                _, _, _, _, pcx, pcy, _ = active_target
+                error_x = pcx - center_x
+                deadband = int(w * 0.08)
 
-        # Place Video Feed on Left (X: 15 to 815, Y: 100 to 700)
-        canvas[100:700, 15:815] = feed
+                # Check if debris is right at the intake mouth (ready to scoop)
+                if pcy > int(h * 0.78) and (intake_left - 30 <= pcx <= intake_right + 30):
+                    if mode != "AUTO_INGEST":
+                        mode = "AUTO_INGEST"
+                        state_timer = now
+                        send_command('C') # Ensure collector paddle is ON
+                        send_command('F') # Push forward over the trash
 
-        # ---- TOP HEADER BAR (Y: 0 to 85) ----
-        cv2.rectangle(canvas, (0, 0), (1280, 85), (22, 27, 34), -1)
-        cv2.line(canvas, (0, 85), (1280, 85), (48, 54, 61), 1)
+                    status_text = "SCOOPING: Driving over trash into rear netting cover!"
 
-        cv2.putText(canvas, "AQUA-SENTRY UNIFIED MISSION CONTROL", (20, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (88, 166, 255), 2)
-        cv2.putText(canvas, f"FPS: {fps:.1f} | WI-FI AP: 192.168.4.1", (20, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (139, 148, 158), 1)
+                    # Drive over it for 2.0 seconds to deposit in rear net
+                    if now - state_timer > 2.0:
+                        collected_count += 1
+                        time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        with open(csv_file, "a", newline="") as f:
+                            csv.writer(f).writerow([time_str, collected_count, "COLLECTED"])
 
-        # State Pill Badge
-        cv2.rectangle(canvas, (550, 18), (815, 66), (33, 38, 45), -1)
-        cv2.rectangle(canvas, (550, 18), (815, 66), hud_color, 1)
-        cv2.putText(canvas, f"STATE: {cleaner.state[:16]}", (560, 46),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, hud_color, 2)
+                        # Save proof snapshot
+                        snap_name = f"trash_data/captures/haul_{collected_count}.jpg"
+                        cv2.imwrite(snap_name, frame)
+                        print(f"[COLLECTION] Trash #{collected_count} scooped! Saved proof to {snap_name}")
 
-        # Emergency Kill Switch Banner
-        cv2.rectangle(canvas, (840, 18), (1260, 66), (218, 54, 51), -1)
-        cv2.putText(canvas, "EMERGENCY KILL SWITCH [X]", (875, 47),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        mode = "AUTO_SEARCH"
+                        status_text = f"Collected trash #{collected_count}! Looking for next target..."
+                else:
+                    # Steering to center the debris
+                    mode = "AUTO_APPROACH"
+                    if now - last_steer_time > 0.4:
+                        if error_x < -deadband:
+                            send_command('L')
+                            status_text = "Steering LEFT toward floating debris..."
+                        elif error_x > deadband:
+                            send_command('R')
+                            status_text = "Steering RIGHT toward floating debris..."
+                        else:
+                            send_command('F')
+                            status_text = "Aligned! Driving forward to collect..."
+                        last_steer_time = now
+            else:
+                # No debris in sight: cruise forward slowly looking for trash
+                mode = "AUTO_SEARCH"
+                status_text = "Searching water surface for floating trash..."
+                if now - last_steer_time > 0.6:
+                    send_command('F')
+                    last_steer_time = now
 
-        # ---- RIGHT SIDEBAR: RADAR MAP & TELEMETRY (X: 835 to 1265) ----
-        sidebar_x = 835
-        cv2.rectangle(canvas, (sidebar_x, 100), (1265, 700), (22, 27, 34), -1)
-        cv2.rectangle(canvas, (sidebar_x, 100), (1265, 700), (48, 54, 61), 1)
+        # ----------------------------------------------------
+        # 4. ON-SCREEN HUD OVERLAYS
+        # ----------------------------------------------------
+        # Top banner
+        cv2.rectangle(frame, (0, 0), (w, 65), (20, 20, 20), -1)
+        cv2.line(frame, (0, 65), (w, 65), (50, 50, 50), 1)
 
-        # 1. 2D Radar Mini-Map
-        map_size = 230
-        minimap = geofence.render_minimap(map_size=map_size)
-        map_start_x = sidebar_x + (430 - map_size) // 2
-        canvas[115:115+map_size, map_start_x:map_start_x+map_size] = minimap
+        # Mode color
+        mode_color = (0, 255, 0) if mode.startswith("AUTO") else (88, 166, 255)
+        if mode == "EMERGENCY_STOP": mode_color = (0, 0, 255)
 
-        # 2. Telemetry Metrics Cards
-        metrics = geofence.get_metrics(logger.category_counts)
-        card_y = 365
+        cv2.putText(frame, "AQUA-SENTRY PROTOTYPE", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.putText(frame, f"MODE: {mode}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 2)
+        cv2.putText(frame, f"COLLECTED: {collected_count}", (260, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        cv2.putText(frame, f"IN SIGHT: {len(targets)}", (440, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
-        cv2.putText(canvas, "MISSION TELEMETRY", (sidebar_x + 20, card_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (88, 166, 255), 2)
-        cv2.line(canvas, (sidebar_x + 20, card_y + 8), (sidebar_x + 410, card_y + 8), (48, 54, 61), 1)
+        # Status Ribbon (Bottom)
+        cv2.rectangle(frame, (0, h - 35), (w, h), (15, 15, 15), -1)
+        cv2.putText(frame, f">> {status_text}", (15, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1)
 
-        # Stat Rows
-        stat_rows = [
-            ("Trash Collected:", f"{cleaner.collected_count} items", (126, 231, 135)),
-            ("Estimated Payload:", f"{metrics['total_weight_kg']} kg  ({metrics['total_volume_l']} L)", (255, 255, 255)),
-            ("Water Swept Area:", f"{metrics['area_covered_sqm']} m2 ({metrics['coverage_pct']}%)", (0, 215, 255)),
-            ("Pond Boundary:", f"{geofence.width_m:.0f}m x {geofence.length_m:.0f}m ({metrics['total_area_sqm']} m2)", (200, 200, 200)),
-            ("Distance Traveled:", f"{metrics['distance_traveled_m']} meters", (200, 200, 200)),
-            ("Debris in View:", f"{len(verified_debris)} targets", (255, 165, 0))
-        ]
+        cv2.imshow(WINDOW_TITLE, frame)
 
-        row_y = card_y + 32
-        for lbl, val, val_col in stat_rows:
-            cv2.putText(canvas, lbl, (sidebar_x + 20, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (139, 148, 158), 1)
-            cv2.putText(canvas, val, (sidebar_x + 220, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.44, val_col, 2)
-            row_y += 24
-
-        # 3. Controls & Hotkey Guide
-        cv2.line(canvas, (sidebar_x + 20, row_y + 5), (sidebar_x + 410, row_y + 5), (48, 54, 61), 1)
-        row_y += 25
-        cv2.putText(canvas, "OPERATOR HOTKEYS:", (sidebar_x + 20, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (88, 166, 255), 1)
-        row_y += 20
-        cv2.putText(canvas, "[A] Autonomous Roomba Mode    [M] Manual Standby", (sidebar_x + 20, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
-        row_y += 18
-        cv2.putText(canvas, "[W/A/S/D] Steering Override   [SPACE] Brake", (sidebar_x + 20, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
-        row_y += 18
-        cv2.putText(canvas, "[C] Toggle Paddle Collector   [Q] Quit & Export", (sidebar_x + 20, row_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
-
-        # 4. Status Message Ribbon (Bottom of Left Pane)
-        cv2.rectangle(canvas, (15, 665), (815, 700), (22, 27, 34), -1)
-        cv2.putText(canvas, f">> {status_msg}", (25, 688),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (230, 230, 230), 1)
-
-        cv2.imshow(WINDOW_NAME, canvas)
-
-        # Keyboard Interactivity
+        # ----------------------------------------------------
+        # 5. KEYBOARD CONTROLS & SAFETY OVERRIDES
+        # ----------------------------------------------------
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
-            print("[INFO] Shutting down Ground Station...")
+            print("[INFO] Exiting console...")
+            send_command('S')
             break
-        elif key == ord('a'): cleaner.set_mode("AUTO")
-        elif key == ord('m'): cleaner.set_mode("MANUAL")
-        elif key == ord('x'):
-            cleaner.set_mode("KILL")
-            print("[ALERT] EMERGENCY STOP ACTIVATED! ALL MOTORS KILLED.")
-        elif key == ord('c'): send_boat_command('C')
+        elif key == ord('a'):
+            mode = "AUTO_SEARCH"
+            send_command('A')
+            send_command('C')
+            print("[MODE] Switched to Autonomous Cleaning Mode.")
+        elif key == ord('m'):
+            mode = "MANUAL"
+            send_command('M')
+            send_command('S')
+            status_text = "Manual mode active."
+            print("[MODE] Switched to Manual Mode.")
+        elif key == ord('x'): # EMERGENCY KILL SWITCH
+            mode = "EMERGENCY_STOP"
+            send_command('X')
+            status_text = "EMERGENCY STOP ACTIVATED! ALL MOTORS STOPPED."
+            print("[ALERT] EMERGENCY STOP SENT!")
+        elif key == ord('c'):
+            send_command('C')
         elif key == ord('p'):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            cap_file = f"captures/dashboard_{timestamp}.jpg"
-            cv2.imwrite(cap_file, canvas)
-            print(f"[SNAPSHOT] Saved: {cap_file}")
+            t_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            snap_path = f"trash_data/captures/manual_{t_str}.jpg"
+            cv2.imwrite(snap_path, frame)
+            print(f"[SNAPSHOT] Saved: {snap_path}")
 
-        # Direct Manual Steering (Immediate safety override)
+        # Direct Manual Steering (Instantly interrupts auto mode!)
         elif key in (ord('w'), ord('s'), ord('a'), ord('d'), 32):
-            if cleaner.state != CleanerState.MANUAL_STANDBY:
-                cleaner.set_mode("MANUAL")
+            if mode != "MANUAL":
+                mode = "MANUAL"
+                send_command('M')
             
-            if key == ord('w'):   send_boat_command('F')
-            elif key == ord('s'): send_boat_command('B')
-            elif key == ord('a'): send_boat_command('L')
-            elif key == ord('d'): send_boat_command('R')
-            elif key == 32:       send_boat_command('S')
-
-    # Export final summary report
-    summary = logger.export_summary(geofence_mapper=geofence)
-    print("\n" + "=" * 60)
-    print("             UNIFIED MISSION SUMMARY REPORT")
-    print("=" * 60)
-    print(f"Mission Duration:        {summary['mission_duration_min']} mins")
-    print(f"Total Trash Collected:   {summary['total_items_collected']} items")
-    print(f"Estimated Payload Mass:  {summary['payload_estimates']['estimated_weight_kg']} kg")
-    print(f"Estimated Volume:        {summary['payload_estimates']['estimated_volume_liters']} Liters")
-    print(f"Water Surface Swept:     {summary['spatial_coverage']['water_area_swept_sqm']} m²")
-    print(f"Geofence Coverage:       {summary['spatial_coverage']['coverage_percentage']} of {summary['spatial_coverage']['total_preset_pond_sqm']} m²")
-    print(f"Distance Traveled:       {summary['spatial_coverage']['distance_traveled_m']} meters")
-    print(f"Collection Rate:         {summary['collection_rate_per_min']} items/min")
-    print(f"Composition Breakdown:   {summary['composition_breakdown']}")
-    print(f"Mission Log:             trash_data/mission_log.csv")
-    print(f"Summary Export:          trash_data/mission_summary.json")
-    print("=" * 60)
+            if key == ord('w'):   send_command('F'); status_text = "Manual: Forward"
+            elif key == ord('s'): send_command('B'); status_text = "Manual: Reverse"
+            elif key == ord('a'): send_command('L'); status_text = "Manual: Steer Left"
+            elif key == ord('d'): send_command('R'); status_text = "Manual: Steer Right"
+            elif key == 32:       send_command('S'); status_text = "Manual: Brake / Stopped"
 
     cap.release()
     cv2.destroyAllWindows()
+    if ser and ser.is_open:
+        ser.close()
 
 if __name__ == "__main__":
     main()
