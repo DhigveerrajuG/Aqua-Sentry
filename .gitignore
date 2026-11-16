@@ -1,0 +1,22 @@
+# Arduino IDE build outputs
+*.hex
+*.bin
+*.elf
+*.o
+*.d
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code & IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
