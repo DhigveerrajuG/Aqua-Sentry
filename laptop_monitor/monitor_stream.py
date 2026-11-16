@@ -1,20 +1,24 @@
 """
 ==============================================================================
-Aqua-Sentry Water-Surface Autonomous Cleaning Console (Water-Roomba Mode)
+Aqua-Sentry Autonomous Cleaning Console with Geofence & Area Mapping
 ==============================================================================
-Functionality:
-  1. Live Video Stream with Intake Guidance & Real-time Collection Telemetry.
-  2. Autonomous Cleaning Loop (Roomba for Water):
-     - SEARCH_PATROL: Scans surrounding waterway for floating trash.
-     - TARGET_APPROACH: Automatically steers and closes distance onto debris.
-     - INGEST_RUNOVER: Runs over the trash with the paddle wheel spinning,
-       drawing it through the pontoon channel and into the rear cover netting.
-     - VERIFY_COLLECTED: Confirms collection and automatically locks onto the next target!
-  3. Safety & Teleoperation:
-     - Touch ANY key (W/A/S/D/SPACE) to instantly interrupt AI and take manual control.
-     - [X] One-Touch EMERGENCY KILL SWITCH cuts all motors and thrusters.
-     - [A] Enter Autonomous Water-Roomba Cleaning Mode.
-     - [M] Switch to Manual Standby.
+Features:
+  1. Live Video Stream with Intake Corridor & Real-time Telemetry.
+  2. Autonomous Cleaning Loop (Water-Roomba Mode):
+     - SEARCH_PATROL: Systematically sweeps the designated water zone.
+     - TARGET_APPROACH: Locks onto nearest debris and maneuvers toward it.
+     - INGEST_RUNOVER: Runs over the trash with the paddle wheel, sweeping it
+       into the rear netting cover.
+     - VERIFY_COLLECTED: Verifies collection and acquires the next target.
+  3. Preset Virtual Water Boundary (Geofence Guard):
+     - Prevents the catamaran from running aground or leaving the pond/lake zone.
+     - Auto-rebounds inward when approaching the perimeter buffer (1.8m).
+  4. Real-time Area Coverage & Payload Mapping:
+     - 2D Top-Down Mini-Map HUD showing swept cells, boat position, and debris.
+     - Live metrics: Area swept (m²), % covered, estimated weight (kg), and volume (L).
+  5. Operator Controls & Safety Failsafes:
+     - Touch ANY key (W/A/S/D/SPACE) to instantly interrupt autonomous mode.
+     - [X] One-Touch EMERGENCY KILL SWITCH.
 ==============================================================================
 """
 
@@ -26,13 +30,14 @@ from datetime import datetime
 
 from trash_classifier import TrashClassifier
 from trash_logger import TrashLogger
+from geofence_mapper import GeofenceMapper
 from autonomous_cleaner import AutonomousCleaner, CleanerState
 
 # Network Configuration
 BASE_URL = "http://192.168.4.1"
 STREAM_URL = f"{BASE_URL}:81/stream"
 CONTROL_URL = f"{BASE_URL}/control?cmd="
-WINDOW_NAME = "Aqua-Sentry Autonomous Cleaning Console"
+WINDOW_NAME = "Aqua-Sentry Mission Console (Geofence & Area Coverage)"
 
 CLASS_COLORS = {
     "Plastic Bottle": (255, 165, 0),    # Orange
@@ -52,12 +57,12 @@ def send_boat_command(cmd_char):
         pass
 
 def main():
-    print("=" * 72)
-    print("  Aqua-Sentry Autonomous Cleaning Robot Console (Water-Roomba Mode)")
-    print("=" * 72)
+    print("=" * 75)
+    print("  Aqua-Sentry Autonomous Cleaning Console with Geofence & Area Mapping")
+    print("=" * 75)
     print("Connecting to live video stream at:", STREAM_URL)
     print("Operating Modes:")
-    print("  [A] Autonomous Cleaning (Scan -> Approach -> Scoop into Rear Net -> Next Target)")
+    print("  [A] Autonomous Cleaning (Scan -> Scoop into Rear Net -> Next Target)")
     print("  [M] Manual Standby Mode")
     print("  [W/A/S/D] Steering (Touching any key immediately overrides autonomous mode)")
     print("  [SPACE] Instant Brake | [X] EMERGENCY KILL SWITCH")
@@ -68,16 +73,17 @@ def main():
         print("[WARN] Port 81 failed, trying fallback port 80...")
         cap = cv2.VideoCapture(f"{BASE_URL}/stream")
         if not cap.isOpened():
-            print("[FATAL] Unable to connect. Ensure your laptop is connected to Wi-Fi 'AquaSentry-Vision'.")
+            print("[FATAL] Could not connect to camera stream. Check Wi-Fi connection to 'AquaSentry-Vision'.")
             return
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, 960, 640)
+    cv2.resizeWindow(WINDOW_NAME, 1020, 680)
 
-    # Initialize Modules
+    # Initialize Modules (Default: 20m x 25m water zone)
+    geofence = GeofenceMapper(pond_width_m=20.0, pond_length_m=25.0, boat_swath_m=0.6)
     classifier = TrashClassifier(use_yolo=False)
     logger = TrashLogger(data_dir="trash_data")
-    cleaner = AutonomousCleaner(send_cmd_fn=send_boat_command)
+    cleaner = AutonomousCleaner(send_cmd_fn=send_boat_command, geofence_mapper=geofence)
 
     prev_time = time.time()
     fps = 0.0
@@ -90,7 +96,6 @@ def main():
             cap = cv2.VideoCapture(STREAM_URL)
             continue
 
-        # FPS calculation
         now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 0.0001))
         prev_time = now
@@ -123,7 +128,7 @@ def main():
                         (x, max(y - 8, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
 
         # ----------------------------------------------------
-        # 2. AUTONOMOUS CLEANING LOGIC (WATER-ROOMBA DECISION)
+        # 2. AUTONOMOUS CLEANING & GEOFENCE CYCLE
         # ----------------------------------------------------
         decision = cleaner.update(frame, verified_debris, logger)
         target_box = decision["target_box"]
@@ -145,46 +150,59 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         # ----------------------------------------------------
-        # 3. MISSION CONTROL & TELEMETRY HUD
+        # 3. SPATIAL COVERAGE & PAYLOAD METRICS
         # ----------------------------------------------------
-        hud_bg = frame[0:90, 0:w].copy()
-        cv2.rectangle(frame, (0, 0), (w, 90), (12, 12, 12), -1)
-        cv2.addWeighted(hud_bg, 0.35, frame[0:90, 0:w], 0.65, 0, frame[0:90, 0:w])
+        metrics = geofence.get_metrics(logger.category_counts)
 
-        # Header Line
-        cv2.putText(frame, "AQUA-SENTRY WATER CLEANING ROBOT", (15, 24),
+        # ----------------------------------------------------
+        # 4. ON-SCREEN HUD OVERLAYS
+        # ----------------------------------------------------
+        hud_bg = frame[0:95, 0:w].copy()
+        cv2.rectangle(frame, (0, 0), (w, 95), (12, 12, 12), -1)
+        cv2.addWeighted(hud_bg, 0.35, frame[0:95, 0:w], 0.65, 0, frame[0:95, 0:w])
+
+        # Row 1: System Title & FPS
+        cv2.putText(frame, "AQUA-SENTRY MISSION CONSOLE", (15, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (88, 166, 255), 2)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (15, 52),
+        cv2.putText(frame, f"FPS: {fps:.1f}", (15, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
-        # State & Stats
-        cv2.putText(frame, f"STATE: {cleaner.state}", (120, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, hud_color, 2)
-        cv2.putText(frame, f"COLLECTED: {cleaner.collected_count}", (360, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
-        cv2.putText(frame, f"IN SIGHT: {len(verified_debris)}", (520, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+        # Row 2: State & Core Metrics
+        cv2.putText(frame, f"STATE: {cleaner.state}", (110, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 2)
+        cv2.putText(frame, f"HAUL: {cleaner.collected_count} items ({metrics['total_weight_kg']} kg | {metrics['total_volume_l']} L)", 
+                    (330, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-        # Status Message Ribbon
-        cv2.putText(frame, status_msg, (15, 78),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 230, 230), 1)
+        # Row 3: Status Message & Area Swept
+        cv2.putText(frame, status_msg, (15, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 230, 230), 1)
+        cv2.putText(frame, f"AREA: {metrics['area_covered_sqm']} m2 ({metrics['coverage_pct']}%)", 
+                    (15, 92), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (120, 220, 120), 1)
+
+        # ----------------------------------------------------
+        # 5. RENDER 2D GEOFENCE RADAR MINI-MAP (TOP-RIGHT CORNER)
+        # ----------------------------------------------------
+        map_size = 175
+        minimap = geofence.render_minimap(map_size=map_size)
+        if w > map_size + 20 and h > map_size + 110:
+            frame[105:105+map_size, w - map_size - 15:w - 15] = minimap
 
         cv2.imshow(WINDOW_NAME, frame)
 
         # ----------------------------------------------------
-        # 4. KEYBOARD INTERRUPTS & SAFETY FAILSAFES
+        # 6. KEYBOARD INTERRUPTS & SAFETY FAILSAFES
         # ----------------------------------------------------
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
             print("[INFO] Shutting down console...")
             break
-        elif key == ord('a'): # Activate Autonomous Roomba Mode
+        elif key == ord('a'): # Autonomous Mode
             cleaner.set_mode("AUTO")
-        elif key == ord('m'): # Switch to Manual Standby
+        elif key == ord('m'): # Manual Standby
             cleaner.set_mode("MANUAL")
         elif key == ord('x'): # EMERGENCY KILL SWITCH
             cleaner.set_mode("KILL")
-            print("[ALERT] EMERGENCY STOP ACTIVATED! PROPELLERS KILLED.")
+            print("[ALERT] EMERGENCY STOP ACTIVATED! ALL MOTORS KILLED.")
         elif key == ord('c'): # Toggle Collector Motor
             send_boat_command('C')
         elif key == ord('p'): # Screenshot
@@ -193,29 +211,34 @@ def main():
             cv2.imwrite(cap_file, frame)
             print(f"[SNAPSHOT] Saved: {cap_file}")
 
-        # Direct Manual Steering (Instantly interrupts auto mode for safety!)
+        # Direct Manual Steering (Instantly interrupts auto mode!)
         elif key in (ord('w'), ord('s'), ord('a'), ord('d'), 32):
             if cleaner.state != CleanerState.MANUAL_STANDBY:
-                cleaner.set_mode("MANUAL") # Take over control immediately
+                cleaner.set_mode("MANUAL")
             
             if key == ord('w'):   send_boat_command('F')
             elif key == ord('s'): send_boat_command('B')
             elif key == ord('a'): send_boat_command('L')
             elif key == ord('d'): send_boat_command('R')
-            elif key == 32:       send_boat_command('S') # Space = Brake
+            elif key == 32:       send_boat_command('S')
 
     # Export Mission Summary upon exit
-    summary = logger.export_summary()
-    print("\n" + "=" * 55)
-    print("             MISSION SUMMARY REPORT")
-    print("=" * 55)
-    print(f"Mission Duration:      {summary['mission_duration_min']} mins")
-    print(f"Total Trash Collected: {cleaner.collected_count} items")
-    print(f"Collection Rate:       {summary['collection_rate_per_min']} items/min")
-    print(f"Composition Breakdown: {summary['composition_breakdown']}")
-    print(f"Mission Log:           trash_data/mission_log.csv")
-    print(f"Summary Export:        trash_data/mission_summary.json")
-    print("=" * 55)
+    summary = logger.export_summary(geofence_mapper=geofence)
+    print("\n" + "=" * 60)
+    print("                MISSION SUMMARY REPORT")
+    print("=" * 60)
+    print(f"Mission Duration:        {summary['mission_duration_min']} mins")
+    print(f"Total Trash Collected:   {summary['total_items_collected']} items")
+    print(f"Estimated Payload Mass:  {summary['payload_estimates']['estimated_weight_kg']} kg")
+    print(f"Estimated Volume:        {summary['payload_estimates']['estimated_volume_liters']} Liters")
+    print(f"Water Surface Swept:     {summary['spatial_coverage']['water_area_swept_sqm']} m²")
+    print(f"Geofence Coverage:       {summary['spatial_coverage']['coverage_percentage']} of {summary['spatial_coverage']['total_preset_pond_sqm']} m²")
+    print(f"Total Distance Traveled: {summary['spatial_coverage']['distance_traveled_m']} meters")
+    print(f"Collection Rate:         {summary['collection_rate_per_min']} items/min")
+    print(f"Composition Breakdown:   {summary['composition_breakdown']}")
+    print(f"Mission Log:             trash_data/mission_log.csv")
+    print(f"Summary Export:          trash_data/mission_summary.json")
+    print("=" * 60)
 
     cap.release()
     cv2.destroyAllWindows()

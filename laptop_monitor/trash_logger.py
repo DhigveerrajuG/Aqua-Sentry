@@ -5,8 +5,8 @@ Aqua-Sentry Mission Data Logger & Active Learning Harvester
 Manages:
   1. Real-time CSV logging of all detected and collected trash events.
   2. Aggregated mission analytics (counts, waste breakdown, collection rate).
-  3. Active dataset collection: saves cropped images with YOLO annotation labels
-     for retraining custom models on local waterway data.
+  3. Spatial Area Coverage & Payload Metrics (m², % covered, kg collected, Liters).
+  4. Active dataset collection: saves cropped images with YOLO annotation labels.
 ==============================================================================
 """
 
@@ -52,7 +52,6 @@ class TrashLogger:
         x, y, w, h = bbox
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Update statistics if item transitioned to COLLECTED
         if status == "COLLECTED" and track_id not in self.collected_ids:
             self.collected_ids.add(track_id)
             self.total_collected += 1
@@ -66,21 +65,16 @@ class TrashLogger:
             ])
 
     def harvest_dataset_sample(self, frame, bbox, class_id, class_name):
-        """
-        Saves a cropped image and YOLO-formatted bounding box label (.txt)
-        so the user can fine-tune their own local AI model.
-        """
+        """Saves a cropped image and YOLO-formatted bounding box label (.txt)."""
         x, y, w, h = bbox
         fh, fw, _ = frame.shape
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
         base_name = f"debris_{class_name}_{timestamp}"
 
-        # 1. Save frame image
         img_path = os.path.join(self.images_dir, f"{base_name}.jpg")
         cv2.imwrite(img_path, frame)
 
-        # 2. Save YOLO-normalized label: <class_id> <x_center> <y_center> <width> <height>
         xc = (x + w / 2.0) / fw
         yc = (y + h / 2.0) / fh
         nw = w / float(fw)
@@ -90,17 +84,31 @@ class TrashLogger:
         with open(label_path, "w") as f:
             f.write(f"{class_id} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}\n")
 
-    def export_summary(self):
-        """Generates a mission summary JSON report."""
+    def export_summary(self, geofence_mapper=None):
+        """Generates a mission summary JSON report including spatial coverage & weight."""
         elapsed_min = max((time.time() - self.start_time) / 60.0, 0.01)
         collection_rate = self.total_collected / elapsed_min
+
+        spatial_metrics = {}
+        if geofence_mapper:
+            spatial_metrics = geofence_mapper.get_metrics(self.category_counts)
 
         summary = {
             "mission_start": datetime.fromtimestamp(self.start_time).strftime("%Y-%m-%d %H:%M:%S"),
             "mission_duration_min": round(elapsed_min, 2),
             "total_items_collected": self.total_collected,
             "collection_rate_per_min": round(collection_rate, 2),
-            "composition_breakdown": self.category_counts
+            "composition_breakdown": self.category_counts,
+            "spatial_coverage": {
+                "water_area_swept_sqm": spatial_metrics.get("area_covered_sqm", 0.0),
+                "total_preset_pond_sqm": spatial_metrics.get("total_area_sqm", 0.0),
+                "coverage_percentage": f"{spatial_metrics.get('coverage_pct', 0.0)}%",
+                "distance_traveled_m": spatial_metrics.get("distance_traveled_m", 0.0)
+            },
+            "payload_estimates": {
+                "estimated_weight_kg": spatial_metrics.get("total_weight_kg", 0.0),
+                "estimated_volume_liters": spatial_metrics.get("total_volume_l", 0.0)
+            }
         }
 
         with open(self.summary_file, "w") as f:
