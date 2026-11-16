@@ -1,16 +1,14 @@
 /**
  * ============================================================================
- * Project: Catamaran Water Surface Trash Collector (Aqua-Sentry Prototype)
+ * Project: Catamaran Water Surface Trash Collector (Aqua-Sentry Advanced FSM)
  * Platform: Arduino Uno / Nano / ESP32 (ATMega328P / Xtensa)
  * Target Hull: Twin PVC Pontoon with Differential Thrust
  * 
- * Architecture: Non-blocking Finite State Machine (FSM) using millis() timing.
- * Features:
- *   - 3-second arming delay for field safety.
- *   - Continuous obstacle scanning with moving-window sanity checks.
- *   - Differential thrust propulsion & autonomous obstacle avoidance.
- *   - Central paddle wheel / conveyor speed regulation.
- *   - Real-time Serial diagnostic telemetry.
+ * Advanced Upgrades:
+ *   1. 3S LiPo Battery Voltage Monitor with Low-Voltage Cut-Off (LVCO @ 9.9V)
+ *   2. Collector Anti-Jam Protection (Stall Current Auto-Reverse & Fault Mode)
+ *   3. Ultrasonic Non-blocking Obstacle Avoidance
+ *   4. Serial Command Interface & Manual Teleoperation Override with Watchdog
  * ============================================================================
  */
 
@@ -32,67 +30,113 @@ const uint8_t PIN_RIGHT_IN4 = 2;    // Direction Pin 4
 
 // Central Trash Collector Mechanism (Conveyor / Paddle Wheel)
 const uint8_t PIN_COLL_PWM  = 6;    // PWM Speed Control (Timer 0)
-const uint8_t PIN_COLL_DIR  = 12;   // Direction / Relay Enable
+const uint8_t PIN_COLL_IN1  = 12;   // Direction A (Forward intake)
+const uint8_t PIN_COLL_IN2  = 11;   // Direction B (Reverse unjam)
 
 // Waterproof Ultrasonic Sensor (JSN-SR04T)
 const uint8_t PIN_US_TRIG   = 5;    // Ultrasonic Trigger
 const uint8_t PIN_US_ECHO   = 3;    // Ultrasonic Echo
+
+// Sensing & Diagnostic Pins
+const uint8_t PIN_BATTERY_ADC = A0; // 3S LiPo Voltage Divider (10k / 4.7k)
+const uint8_t PIN_CURRENT_ADC = A2; // ACS712 Current Sensor for Collector Motor
+const uint8_t PIN_BUZZER_LED  = 13; // Warning buzzer / onboard status LED
 
 // ==========================================
 // SYSTEM TUNING & CALIBRATION PARAMETERS
 // ==========================================
 
 // Speeds (0 - 255)
-const uint8_t SPEED_FORWARD_LEFT   = 180;  // 180/255 Forward speed
-const uint8_t SPEED_FORWARD_RIGHT  = 180;  // 180/255 Forward speed
-const uint8_t SPEED_REVERSE        = 160;  // Reverse clearance speed
-const uint8_t SPEED_TURN           = 190;  // Differential turn thrust
-const uint8_t SPEED_COLLECTOR      = 191;  // 75% Duty Cycle (0.75 * 255 = 191)
+const uint8_t SPEED_FORWARD_LEFT   = 180;
+const uint8_t SPEED_FORWARD_RIGHT  = 180;
+const uint8_t SPEED_REVERSE        = 160;
+const uint8_t SPEED_TURN           = 190;
+const uint8_t SPEED_COLLECTOR      = 191; // 75% Duty Cycle (0.75 * 255 = 191)
+const uint8_t SPEED_UNJAM          = 240; // High torque for reverse unjam
+
+// Battery Parameters (3S LiPo: 12.6V Full, 11.1V Nominal, 9.9V Cutoff)
+// Voltage Divider: R1 = 10k, R2 = 4.7k -> Ratio = (10 + 4.7) / 4.7 = 3.1276
+const float   VOLTAGE_DIVIDER_RATIO = 3.1276f;
+const float   LIPO_WARN_VOLTAGE     = 10.5f; // Warning threshold (3.5V/cell)
+const float   LIPO_CUTOFF_VOLTAGE   = 9.9f;  // Critical cutoff (3.3V/cell)
+
+// Collector Jam Detection (ACS712 5A Sensitivity: 185mV/A, Vref = 2.5V)
+const float   JAM_CURRENT_THRESHOLD_A = 2.4f; // Amperes considered as motor stall
+const unsigned long JAM_DEBOUNCE_MS   = 400;  // Must exceed threshold for 400ms
+const uint8_t MAX_UNJAM_RETRIES       = 3;    // Max auto-unjam attempts
 
 // Obstacle Avoidance Thresholds
-const float   OBSTACLE_DIST_CM     = 60.0f; // Obstacle trigger distance (cm)
-const float   SENSOR_MIN_VALID_CM  = 20.0f; // JSN-SR04T blind spot lower limit
-const float   SENSOR_MAX_VALID_CM  = 350.0f;// Ultrasonic sanity ceiling limit
+const float   OBSTACLE_DIST_CM     = 60.0f;
+const float   SENSOR_MIN_VALID_CM  = 20.0f;
+const float   SENSOR_MAX_VALID_CM  = 350.0f;
 
-// Non-blocking Timing (milliseconds)
-const unsigned long DELAY_STARTUP_MS     = 3000; // 3-second startup safety delay
-const unsigned long INTERVAL_SENSOR_MS   = 60;   // Ultrasonic polling interval
-const unsigned long INTERVAL_TELEMETRY_MS= 200;  // Serial monitor debug rate
-const unsigned long DURATION_REVERSE_MS  = 1500; // Time spent reversing
-const unsigned long DURATION_TURN_MS     = 1500; // Time spent turning right
+// Timing Constants (milliseconds)
+const unsigned long DELAY_STARTUP_MS       = 3000;
+const unsigned long INTERVAL_SENSOR_MS     = 60;
+const unsigned long INTERVAL_TELEMETRY_MS  = 250;
+const unsigned long INTERVAL_BATTERY_MS   = 500;
+const unsigned long DURATION_REVERSE_MS    = 1500;
+const unsigned long DURATION_TURN_MS       = 1500;
+const unsigned long DURATION_UNJAM_REV_MS  = 1200; // Duration of reverse unjam pulse
+const unsigned long WATCHDOG_TIMEOUT_MS    = 2000; // Manual control failsafe timeout
 
 // ==========================================
-// STATE MACHINE DEFINITION
+// STATE DEFINITIONS
 // ==========================================
-enum RobotState {
-  STATE_STANDBY,        // Initial safety hold after power-on
-  STATE_NAV_FORWARD,    // Cruising forward & collecting trash
-  STATE_AVOID_STOP,     // Emergency brake on obstacle detection
-  STATE_AVOID_REVERSE,  // Backing away from hazard
-  STATE_AVOID_TURN      // Differential turn to bypass obstacle
+enum NavMode {
+  MODE_AUTONOMOUS,
+  MODE_MANUAL_OVERRIDE
 };
 
-// Global State Variables
-RobotState currentState = STATE_STANDBY;
-unsigned long stateTimer      = 0;
-unsigned long lastSensorTime  = 0;
-unsigned long lastSerialTime  = 0;
-float currentDistanceCm       = 999.0f;
+enum NavState {
+  STATE_STANDBY,
+  STATE_NAV_FORWARD,
+  STATE_AVOID_STOP,
+  STATE_AVOID_REVERSE,
+  STATE_AVOID_TURN,
+  STATE_LOW_BATTERY_LOCKOUT
+};
+
+enum CollectorState {
+  COLL_IDLE,
+  COLL_FORWARD,
+  COLL_UNJAM_REVERSING,
+  COLL_JAM_FAULT
+};
+
+// Global System Variables
+NavMode        currentMode      = MODE_AUTONOMOUS;
+NavState       currentState     = STATE_STANDBY;
+CollectorState collState        = COLL_IDLE;
+
+unsigned long stateTimer        = 0;
+unsigned long collTimer         = 0;
+unsigned long lastSensorTime    = 0;
+unsigned long lastSerialTime    = 0;
+unsigned long lastBatteryTime   = 0;
+unsigned long lastCommandTime   = 0;
+
+float currentDistanceCm         = 999.0f;
+float batteryVoltage            = 12.6f;
+float collectorCurrentA         = 0.0f;
+uint8_t unjamRetryCount         = 0;
+char manualCmd                  = 'S';
 
 // ==========================================
-// HELPER FUNCTIONS & PROTOTYPES
+// FUNCTION DECLARATIONS
 // ==========================================
-inline float safeMax(float a, float b) {
-  return (a > b) ? a : b;
-}
-
 float readUltrasonic();
-void  moveForward(uint8_t leftSpeed, uint8_t rightSpeed);
+float readBatteryVoltage();
+float readCollectorCurrent();
+void  processSerialCommands();
+void  runNavStateMachine();
+void  runCollectorStateMachine();
+void  moveForward(uint8_t left, uint8_t right);
 void  moveReverse(uint8_t speed);
 void  turnRight(uint8_t speed);
+void  turnLeft(uint8_t speed);
 void  stopThrusters();
-void  runCollector(uint8_t speed);
-void  avoidObstacleStateMachine();
+void  setCollectorMotor(int speed); // positive = forward, negative = reverse, 0 = off
 void  logDiagnostics();
 
 // ==========================================
@@ -100,13 +144,7 @@ void  logDiagnostics();
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 1000); // Wait for serial console on USB-capable chips
 
-  Serial.println(F("\n=================================================="));
-  Serial.println(F("   Aqua-Sentry Autonomous Catamaran Controller   "));
-  Serial.println(F("=================================================="));
-
-  // Initialize Motor Control Pins
   pinMode(PIN_LEFT_ENA, OUTPUT);
   pinMode(PIN_LEFT_IN1, OUTPUT);
   pinMode(PIN_LEFT_IN2, OUTPUT);
@@ -116,38 +154,82 @@ void setup() {
   pinMode(PIN_RIGHT_IN4, OUTPUT);
 
   pinMode(PIN_COLL_PWM, OUTPUT);
-  pinMode(PIN_COLL_DIR, OUTPUT);
+  pinMode(PIN_COLL_IN1, OUTPUT);
+  pinMode(PIN_COLL_IN2, OUTPUT);
 
-  // Initialize Ultrasonic Sensor Pins
   pinMode(PIN_US_TRIG, OUTPUT);
   pinMode(PIN_US_ECHO, INPUT);
   digitalWrite(PIN_US_TRIG, LOW);
 
-  // Ensure all actuators start safely in OFF state
-  stopThrusters();
-  runCollector(0);
+  pinMode(PIN_BUZZER_LED, OUTPUT);
+  digitalWrite(PIN_BUZZER_LED, LOW);
 
-  Serial.println(F("[SAFETY] 3-Second Arming Delay in progress... Keep clear of thrusters."));
-  stateTimer = millis();
-  currentState = STATE_STANDBY;
+  stopThrusters();
+  setCollectorMotor(0);
+
+  // Initial Battery Voltage check
+  batteryVoltage = readBatteryVoltage();
+  Serial.println(F("\n======================================================="));
+  Serial.println(F("   Aqua-Sentry Autonomous Catamaran - Advanced System  "));
+  Serial.println(F("======================================================="));
+  Serial.print(F("[POWER] Initial Battery Voltage: "));
+  Serial.print(batteryVoltage, 2);
+  Serial.println(F(" V"));
+
+  if (batteryVoltage < LIPO_CUTOFF_VOLTAGE && batteryVoltage > 5.0f) {
+    Serial.println(F("[CRITICAL] Low battery at boot! Entering Lockout mode."));
+    currentState = STATE_LOW_BATTERY_LOCKOUT;
+  } else {
+    Serial.println(F("[SAFETY] Arming delay (3.0s)... Keep clear of propellers."));
+    stateTimer = millis();
+    currentState = STATE_STANDBY;
+  }
+
+  lastCommandTime = millis();
 }
 
 // ==========================================
-// ARDUINO MAIN LOOP
+// MAIN CONTROL LOOP
 // ==========================================
 void loop() {
   unsigned long now = millis();
 
-  // 1. Periodic non-blocking ultrasonic reading
+  // 1. Process Remote Failsafe & Manual Commands from ESP32-CAM / Laptop
+  processSerialCommands();
+
+  // 2. Battery Health & Voltage Monitoring
+  if (now - lastBatteryTime >= INTERVAL_BATTERY_MS) {
+    lastBatteryTime = now;
+    batteryVoltage = readBatteryVoltage();
+
+    if (batteryVoltage <= LIPO_CUTOFF_VOLTAGE && batteryVoltage > 6.0f) {
+      if (currentState != STATE_LOW_BATTERY_LOCKOUT) {
+        Serial.println(F("\n[CRITICAL ERROR] Battery below 9.9V! Auto-shutting down to save LiPo cells."));
+        stopThrusters();
+        setCollectorMotor(0);
+        currentState = STATE_LOW_BATTERY_LOCKOUT;
+      }
+    } else if (batteryVoltage <= LIPO_WARN_VOLTAGE && batteryVoltage > 6.0f) {
+      digitalWrite(PIN_BUZZER_LED, (now / 300) % 2); // Pulse LED/Buzzer warning
+    } else {
+      digitalWrite(PIN_BUZZER_LED, LOW);
+    }
+  }
+
+  // 3. Periodic Ultrasonic Obstacle Sensing
   if (now - lastSensorTime >= INTERVAL_SENSOR_MS) {
     lastSensorTime = now;
     currentDistanceCm = readUltrasonic();
   }
 
-  // 2. Obstacle Avoidance & Navigation State Machine
-  avoidObstacleStateMachine();
+  // 4. Current & Jam Detection for Collector Motor
+  collectorCurrentA = readCollectorCurrent();
+  runCollectorStateMachine();
 
-  // 3. Periodic Serial Diagnostics
+  // 5. Navigation & FSM Execution
+  runNavStateMachine();
+
+  // 6. Diagnostics Telemetry Output
   if (now - lastSerialTime >= INTERVAL_TELEMETRY_MS) {
     lastSerialTime = now;
     logDiagnostics();
@@ -155,93 +237,259 @@ void loop() {
 }
 
 // ==========================================
-// ULTRASONIC SENSOR SUBSYSTEM
+// BATTERY SENSING & CURRENT MONITORING
 // ==========================================
-/**
- * Triggers a 10µs pulse to the JSN-SR04T transducer and calculates distance.
- * Includes a timeout of 25ms to prevent blocking the main loop if an echo is lost.
- */
-float readUltrasonic() {
-  // Clear trigger line
-  digitalWrite(PIN_US_TRIG, LOW);
-  delayMicroseconds(4);
+float readBatteryVoltage() {
+  int rawADC = analogRead(PIN_BATTERY_ADC);
+  // Arduino Uno Vref = 5.0V, 10-bit ADC (1023 steps)
+  float pinVoltage = (rawADC * 5.0f) / 1023.0f;
+  float calculatedBat = pinVoltage * VOLTAGE_DIVIDER_RATIO;
+  
+  // Exponential Moving Average (EMA) to smooth out inductive motor spikes
+  static float filteredBat = 12.4f;
+  filteredBat = (0.85f * filteredBat) + (0.15f * calculatedBat);
+  return filteredBat;
+}
 
-  // Send 10µs ultrasonic start pulse
-  digitalWrite(PIN_US_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_US_TRIG, LOW);
-
-  // Measure round-trip time (max 25000 µs ~= 430 cm max range)
-  unsigned long duration = pulseIn(PIN_US_ECHO, HIGH, 25000UL);
-
-  // pulseIn returned 0 implies timeout (out of range or hardware disconnected)
-  if (duration == 0) {
-    return safeMax(currentDistanceCm, 400.0f);
-  }
-
-  // Distance calculation: Speed of sound in air ~ 0.0343 cm/µs
-  float calculatedDistance = (duration * 0.0343f) / 2.0f;
-
-  // Filter out spurious echoes below the physical transducer blind zone (~20 cm)
-  if (calculatedDistance < SENSOR_MIN_VALID_CM && calculatedDistance > 0.0f) {
-    return SENSOR_MIN_VALID_CM; 
-  }
-
-  return calculatedDistance;
+float readCollectorCurrent() {
+  int rawADC = analogRead(PIN_CURRENT_ADC);
+  float voltage = (rawADC * 5.0f) / 1023.0f;
+  // ACS712-05B: Zero current = 2.5V, Sensitivity = 185mV/A
+  float current = fabs((voltage - 2.5f) / 0.185f);
+  
+  static float filteredCurrent = 0.0f;
+  filteredCurrent = (0.7f * filteredCurrent) + (0.3f * current);
+  return filteredCurrent;
 }
 
 // ==========================================
-// ROBOT MOTION CONTROL SUBSYSTEM
+// SERIAL COMMAND PROCESSOR & WATCHDOG
 // ==========================================
+void processSerialCommands() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    lastCommandTime = millis(); // Reset watchdog timer
 
-/**
- * Commands both thrusters forward with specified PWM values.
- */
-void moveForward(uint8_t leftSpeed, uint8_t rightSpeed) {
-  // Left Thruster: Forward (IN1 = HIGH, IN2 = LOW)
+    switch (c) {
+      case 'M': // Switch to Manual Teleoperation Mode
+        currentMode = MODE_MANUAL_OVERRIDE;
+        stopThrusters();
+        Serial.println(F("[MODE] Switched to MANUAL Teleoperation"));
+        break;
+
+      case 'A': // Switch to Autonomous Navigation Mode
+        currentMode = MODE_AUTONOMOUS;
+        Serial.println(F("[MODE] Switched to AUTONOMOUS Cruise"));
+        break;
+
+      case 'F': manualCmd = 'F'; break; // Forward
+      case 'B': manualCmd = 'B'; break; // Reverse
+      case 'L': manualCmd = 'L'; break; // Pivot Left
+      case 'R': manualCmd = 'R'; break; // Pivot Right
+      case 'S': manualCmd = 'S'; break; // Stop / Brake
+      
+      case 'C': // Toggle Collector
+        if (collState == COLL_IDLE) collState = COLL_FORWARD;
+        else collState = COLL_IDLE;
+        break;
+
+      case 'X': // Emergency Kill Switch
+        stopThrusters();
+        setCollectorMotor(0);
+        currentMode = MODE_MANUAL_OVERRIDE;
+        manualCmd = 'S';
+        Serial.println(F("[ALERT] EMERGENCY STOP ACTIVATED"));
+        break;
+    }
+  }
+
+  // Failsafe Watchdog: If in manual mode and no command received for > 2.0s, stop motors
+  if (currentMode == MODE_MANUAL_OVERRIDE && (millis() - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
+    manualCmd = 'S';
+  }
+}
+
+// ==========================================
+// NAVIGATION & MOTION STATE MACHINE
+// ==========================================
+void runNavStateMachine() {
+  if (currentState == STATE_LOW_BATTERY_LOCKOUT) {
+    stopThrusters();
+    setCollectorMotor(0);
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // ---- MANUAL OVERRIDE MODE ----
+  if (currentMode == MODE_MANUAL_OVERRIDE) {
+    switch (manualCmd) {
+      case 'F': moveForward(SPEED_FORWARD_LEFT, SPEED_FORWARD_RIGHT); break;
+      case 'B': moveReverse(SPEED_REVERSE); break;
+      case 'L': turnLeft(SPEED_TURN); break;
+      case 'R': turnRight(SPEED_TURN); break;
+      case 'S':
+      default:  stopThrusters(); break;
+    }
+    return;
+  }
+
+  // ---- AUTONOMOUS CRUISE MODE ----
+  switch (currentState) {
+    case STATE_STANDBY:
+      if (now - stateTimer >= DELAY_STARTUP_MS) {
+        Serial.println(F("[SYSTEM] Armed. Starting Autonomous Cruise & Collection."));
+        currentState = STATE_NAV_FORWARD;
+        collState = COLL_FORWARD;
+      }
+      break;
+
+    case STATE_NAV_FORWARD:
+      moveForward(SPEED_FORWARD_LEFT, SPEED_FORWARD_RIGHT);
+
+      // Trigger avoidance on obstacle within 60 cm
+      if (currentDistanceCm <= OBSTACLE_DIST_CM && currentDistanceCm >= (SENSOR_MIN_VALID_CM - 5.0f)) {
+        Serial.println(F("[OBSTACLE] Hazard detected ahead! Stopping."));
+        stopThrusters();
+        stateTimer = now;
+        currentState = STATE_AVOID_STOP;
+      }
+      break;
+
+    case STATE_AVOID_STOP:
+      stopThrusters();
+      if (now - stateTimer >= 150) { // Settle inertia
+        stateTimer = now;
+        currentState = STATE_AVOID_REVERSE;
+      }
+      break;
+
+    case STATE_AVOID_REVERSE:
+      moveReverse(SPEED_REVERSE);
+      if (now - stateTimer >= DURATION_REVERSE_MS) {
+        stopThrusters();
+        stateTimer = now;
+        currentState = STATE_AVOID_TURN;
+      }
+      break;
+
+    case STATE_AVOID_TURN:
+      turnRight(SPEED_TURN);
+      if (now - stateTimer >= DURATION_TURN_MS) {
+        stopThrusters();
+        Serial.println(F("[OBSTACLE] Path clear. Resuming forward cruise."));
+        currentState = STATE_NAV_FORWARD;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ==========================================
+// ANTI-JAM COLLECTOR STATE MACHINE
+// ==========================================
+void runCollectorStateMachine() {
+  if (currentState == STATE_LOW_BATTERY_LOCKOUT) {
+    setCollectorMotor(0);
+    return;
+  }
+
+  unsigned long now = millis();
+  static unsigned long jamStartTime = 0;
+
+  switch (collState) {
+    case COLL_IDLE:
+      setCollectorMotor(0);
+      unjamRetryCount = 0;
+      break;
+
+    case COLL_FORWARD:
+      setCollectorMotor(SPEED_COLLECTOR);
+
+      // Current Spike / Jam Check
+      if (collectorCurrentA > JAM_CURRENT_THRESHOLD_A) {
+        if (jamStartTime == 0) {
+          jamStartTime = now;
+        } else if (now - jamStartTime > JAM_DEBOUNCE_MS) {
+          // Sustained high current = Motor Stall / Weed Jam
+          Serial.println(F("[JAM DETECTED] High current on collector! Initiating reverse unjam."));
+          collTimer = now;
+          jamStartTime = 0;
+          collState = COLL_UNJAM_REVERSING;
+        }
+      } else {
+        jamStartTime = 0;
+      }
+      break;
+
+    case COLL_UNJAM_REVERSING:
+      setCollectorMotor(-SPEED_UNJAM); // Reverse full speed
+
+      if (now - collTimer >= DURATION_UNJAM_REV_MS) {
+        unjamRetryCount++;
+        if (unjamRetryCount >= MAX_UNJAM_RETRIES) {
+          Serial.println(F("[JAM FAULT] Paddle wheel failed to clear after 3 attempts. Disabling collector."));
+          collState = COLL_JAM_FAULT;
+        } else {
+          Serial.print(F("[UNJAM] Reverse burst finished. Attempting forward intake (Retry "));
+          Serial.print(unjamRetryCount);
+          Serial.println(F("/3)"));
+          collState = COLL_FORWARD;
+        }
+      }
+      break;
+
+    case COLL_JAM_FAULT:
+      setCollectorMotor(0); // Protect motor & driver from burning
+      break;
+  }
+}
+
+// ==========================================
+// MOTOR ACTUATION PRIMITIVES
+// ==========================================
+void moveForward(uint8_t left, uint8_t right) {
   digitalWrite(PIN_LEFT_IN1, HIGH);
   digitalWrite(PIN_LEFT_IN2, LOW);
-  analogWrite(PIN_LEFT_ENA, leftSpeed);
+  analogWrite(PIN_LEFT_ENA, left);
 
-  // Right Thruster: Forward (IN3 = HIGH, IN4 = LOW)
   digitalWrite(PIN_RIGHT_IN3, HIGH);
   digitalWrite(PIN_RIGHT_IN4, LOW);
-  analogWrite(PIN_RIGHT_ENB, rightSpeed);
+  analogWrite(PIN_RIGHT_ENB, right);
 }
 
-/**
- * Reverses both thrusters simultaneously to back away from an obstacle.
- */
 void moveReverse(uint8_t speed) {
-  // Left Thruster: Reverse (IN1 = LOW, IN2 = HIGH)
   digitalWrite(PIN_LEFT_IN1, LOW);
   digitalWrite(PIN_LEFT_IN2, HIGH);
   analogWrite(PIN_LEFT_ENA, speed);
 
-  // Right Thruster: Reverse (IN3 = LOW, IN4 = HIGH)
   digitalWrite(PIN_RIGHT_IN3, LOW);
   digitalWrite(PIN_RIGHT_IN4, HIGH);
   analogWrite(PIN_RIGHT_ENB, speed);
 }
 
-/**
- * Executes a right turn by powering only the left thruster (differential steering).
- */
 void turnRight(uint8_t speed) {
-  // Left Thruster: Forward drive
   digitalWrite(PIN_LEFT_IN1, HIGH);
   digitalWrite(PIN_LEFT_IN2, LOW);
   analogWrite(PIN_LEFT_ENA, speed);
 
-  // Right Thruster: Idle/Brake
   digitalWrite(PIN_RIGHT_IN3, LOW);
   digitalWrite(PIN_RIGHT_IN4, LOW);
   analogWrite(PIN_RIGHT_ENB, 0);
 }
 
-/**
- * Immediately brakes/coasts both thrusters to zero RPM.
- */
+void turnLeft(uint8_t speed) {
+  digitalWrite(PIN_LEFT_IN1, LOW);
+  digitalWrite(PIN_LEFT_IN2, LOW);
+  analogWrite(PIN_LEFT_ENA, 0);
+
+  digitalWrite(PIN_RIGHT_IN3, HIGH);
+  digitalWrite(PIN_RIGHT_IN4, LOW);
+  analogWrite(PIN_RIGHT_ENB, speed);
+}
+
 void stopThrusters() {
   digitalWrite(PIN_LEFT_IN1, LOW);
   digitalWrite(PIN_LEFT_IN2, LOW);
@@ -252,103 +500,73 @@ void stopThrusters() {
   analogWrite(PIN_RIGHT_ENB, 0);
 }
 
-/**
- * Controls the central paddle wheel or trash conveyor mechanism.
- * @param speed: PWM level (0 to 255). 0 stops rotation.
- */
-void runCollector(uint8_t speed) {
+void setCollectorMotor(int speed) {
   if (speed > 0) {
-    digitalWrite(PIN_COLL_DIR, HIGH); // Intake rotation direction
+    // Forward rotation (intake)
+    digitalWrite(PIN_COLL_IN1, HIGH);
+    digitalWrite(PIN_COLL_IN2, LOW);
     analogWrite(PIN_COLL_PWM, speed);
+  } else if (speed < 0) {
+    // Reverse rotation (anti-jam ejection)
+    digitalWrite(PIN_COLL_IN1, LOW);
+    digitalWrite(PIN_COLL_IN2, HIGH);
+    analogWrite(PIN_COLL_PWM, abs(speed));
   } else {
-    digitalWrite(PIN_COLL_DIR, LOW);
+    // Brake / Stop
+    digitalWrite(PIN_COLL_IN1, LOW);
+    digitalWrite(PIN_COLL_IN2, LOW);
     analogWrite(PIN_COLL_PWM, 0);
   }
 }
 
 // ==========================================
-// STATE MACHINE & OBSTACLE AVOIDANCE
+// ULTRASONIC SENSOR SUBSYSTEM
 // ==========================================
-void avoidObstacleStateMachine() {
-  unsigned long now = millis();
+float readUltrasonic() {
+  digitalWrite(PIN_US_TRIG, LOW);
+  delayMicroseconds(4);
+  digitalWrite(PIN_US_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_US_TRIG, LOW);
 
-  switch (currentState) {
+  unsigned long duration = pulseIn(PIN_US_ECHO, HIGH, 25000UL);
+  if (duration == 0) return 400.0f;
 
-    // 1. Initial 3-second startup safety delay
-    case STATE_STANDBY:
-      if (now - stateTimer >= DELAY_STARTUP_MS) {
-        Serial.println(F("[SYSTEM] Armed. Starting navigation and trash collection."));
-        currentState = STATE_NAV_FORWARD;
-      }
-      break;
-
-    // 2. Normal operational cruise
-    case STATE_NAV_FORWARD:
-      // Keep conveyor actively running during forward collection
-      runCollector(SPEED_COLLECTOR);
-      moveForward(SPEED_FORWARD_LEFT, SPEED_FORWARD_RIGHT);
-
-      // Check if distance reading falls within trigger boundary
-      if (currentDistanceCm <= OBSTACLE_DIST_CM && currentDistanceCm >= (SENSOR_MIN_VALID_CM - 5.0f)) {
-        Serial.println(F("[ALERT] Obstacle detected! Initiating evasive sequence."));
-        stopThrusters();
-        stateTimer = now;
-        currentState = STATE_AVOID_STOP;
-      }
-      break;
-
-    // 3. Inertia dampening stop (brief 150ms pause before reversing)
-    case STATE_AVOID_STOP:
-      stopThrusters();
-      if (now - stateTimer >= 150) { 
-        stateTimer = now;
-        currentState = STATE_AVOID_REVERSE;
-      }
-      break;
-
-    // 4. Reverse away from the obstacle for 1.5 seconds
-    case STATE_AVOID_REVERSE:
-      moveReverse(SPEED_REVERSE);
-      if (now - stateTimer >= DURATION_REVERSE_MS) {
-        stopThrusters();
-        stateTimer = now;
-        currentState = STATE_AVOID_TURN;
-      }
-      break;
-
-    // 5. Differential pivot turn to the right for 1.5 seconds
-    case STATE_AVOID_TURN:
-      turnRight(SPEED_TURN);
-      if (now - stateTimer >= DURATION_TURN_MS) {
-        stopThrusters();
-        Serial.println(F("[RECOVERY] Obstacle cleared. Resuming forward cruise."));
-        currentState = STATE_NAV_FORWARD;
-      }
-      break;
-  }
+  float dist = (duration * 0.0343f) / 2.0f;
+  if (dist < SENSOR_MIN_VALID_CM && dist > 0.0f) return SENSOR_MIN_VALID_CM;
+  return dist;
 }
 
 // ==========================================
-// TELEMETRY / SERIAL DIAGNOSTICS
+// SERIAL TELEMETRY DIAGNOSTICS
 // ==========================================
 void logDiagnostics() {
-  Serial.print(F("Time: "));
-  Serial.print(millis() / 1000.0f, 1);
-  Serial.print(F("s | Dist: "));
+  Serial.print(F("V_BAT:"));
+  Serial.print(batteryVoltage, 2);
+  Serial.print(F("V | I_COLL:"));
+  Serial.print(collectorCurrentA, 2);
+  Serial.print(F("A | DIST:"));
+  if (currentDistanceCm >= SENSOR_MAX_VALID_CM) Serial.print(F("CLEAR"));
+  else { Serial.print(currentDistanceCm, 0); Serial.print(F("cm")); }
 
-  if (currentDistanceCm >= SENSOR_MAX_VALID_CM) {
-    Serial.print(F("CLEAR (>350)"));
-  } else {
-    Serial.print(currentDistanceCm, 1);
-    Serial.print(F(" cm"));
+  Serial.print(F(" | MODE:"));
+  Serial.print(currentMode == MODE_AUTONOMOUS ? F("AUTO") : F("MANUAL"));
+
+  Serial.print(F(" | STATE:"));
+  switch (currentState) {
+    case STATE_STANDBY:       Serial.print(F("ARMING")); break;
+    case STATE_NAV_FORWARD:   Serial.print(F("CRUISE")); break;
+    case STATE_AVOID_STOP:    Serial.print(F("BRAKE")); break;
+    case STATE_AVOID_REVERSE: Serial.print(F("REVERSE")); break;
+    case STATE_AVOID_TURN:    Serial.print(F("TURN_R")); break;
+    case STATE_LOW_BATTERY_LOCKOUT: Serial.print(F("BAT_LOCKOUT")); break;
   }
 
-  Serial.print(F(" | FSM: "));
-  switch (currentState) {
-    case STATE_STANDBY:       Serial.println(F("STANDBY (Arming)")); break;
-    case STATE_NAV_FORWARD:   Serial.println(F("CRUISE (Forward + Collector 75%)")); break;
-    case STATE_AVOID_STOP:    Serial.println(F("AVOID: BRAKING")); break;
-    case STATE_AVOID_REVERSE: Serial.println(F("AVOID: REVERSING (1.5s)")); break;
-    case STATE_AVOID_TURN:    Serial.println(F("AVOID: TURNING RIGHT (1.5s)")); break;
+  Serial.print(F(" | COLL:"));
+  switch (collState) {
+    case COLL_IDLE:             Serial.println(F("OFF")); break;
+    case COLL_FORWARD:          Serial.println(F("RUN")); break;
+    case COLL_UNJAM_REVERSING:  Serial.println(F("UNJAMMING")); break;
+    case COLL_JAM_FAULT:        Serial.println(F("FAULT")); break;
   }
 }
