@@ -1,21 +1,32 @@
-MIT License
+PROPRIETARY & INTELLECTUAL PROPERTY NOTICE
+===========================================
+Aqua-Sentry: Autonomous Surface Waste Collector Prototype
+Copyright (c) 2026 Dhigveerraju G. All Rights Reserved.
 
-Copyright (c) 2026 DhigveerrajuG and Aqua-Sentry Contributors
+TERMS AND CONDITIONS OF USE & REPOSITORY ACCESS:
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. INTELLECTUAL PROPERTY OWNERSHIP:
+   This project, including but not limited to the firmware source code,
+   computer vision algorithms, circuit schematics, CAD designs, mechanical
+   flow-through specifications, and documentation, is the exclusive intellectual
+   property of Dhigveerraju G ("Owner").
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. STRICT PROHIBITION ON COPYING & RE-POSTING:
+   - You are STRICTLY PROHIBITED from copying, duplicating, re-hosting, cloning,
+     or re-publishing this project (in whole or in part) into your own public or
+     private code repositories (e.g., GitHub, GitLab, Bitbucket, or any other platform).
+   - You may NOT present, submit, or claim this project or its code as your own work
+     for any academic, institutional, competition, or commercial purpose.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+3. AUTHORIZED COLLABORATION:
+   - Individuals interested in working on or improving the project may do so ONLY
+     by contributing directly to this original repository through authorized Pull Requests
+     submitted to https://github.com/DhigveerrajuG/Aqua-Sentry.
+   - Any approved contributions shall remain integrated within this original project
+     under the governance of the Owner.
+
+4. NO WARRANTY:
+   THIS REPOSITORY AND CODE ARE PROVIDED BY THE COPYRIGHT HOLDER "AS IS" WITHOUT
+   EXPRESS OR IMPLIED WARRANTIES OF ANY KIND. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+   BE LIABLE FOR ANY DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES ARISING FROM THE USE
+   OR TESTING OF THIS HARDWARE OR SOFTWARE.
